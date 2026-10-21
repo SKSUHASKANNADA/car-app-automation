@@ -48,14 +48,13 @@ FORWARD_PULSE_MS = 320
 SETTLE_MS = 300
 LOOP_HZ = 5
 
-POSE_MAX_AGE_S = 0.5    # pose older than this = stale -> stop
-MARKER_LOST_S = 0.8     # car marker unseen this long -> stop
-NO_PROGRESS_S = 60.0
-
-CMD_FWD, CMD_RIGHT, CMD_LEFT, CMD_STOP = "8", "4", "6", "5"
+CMD_FWD, CMD_BACK, CMD_LEFT, CMD_RIGHT, CMD_STOP = "8", "2", "4", "6", "5"
 MODE_MANUAL, MODE_AUTO, MODE_ROUTE = "M", "A", "R"
 
-TURN_SIGN = 1           # flip to -1 if car turns opposite direction
+TURN_SIGN = 1           # 1 = standard screen CCW/CW, -1 = inverted
+POSE_MAX_AGE_S = 1.2    # pose older than this = stale -> stop
+MARKER_LOST_S = 2.0     # allow up to 2.0s without marker before stopping (filters glare/drops)
+NO_PROGRESS_S = 60.0
 
 ARUCO_DICT_ID = cv2.aruco.DICT_4X4_50 if cv2 is not None else None
 CAR_ID = 10
@@ -585,11 +584,16 @@ class RoutePlannerApp:
         rrow2 = tk.Frame(rf_inner, bg="#ffffff")
         rrow2.pack(fill="x", pady=4)
         self.dry_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(rrow2, text="Dry Run (Simulate on Screen)", variable=self.dry_var,
+        tk.Checkbutton(rrow2, text="Dry Run", variable=self.dry_var,
                        bg="#ffffff", activebackground="#ffffff").pack(side="left")
-        tk.Button(rrow2, text="Test Turn", font=("Segoe UI", 8),
+
+        self.invert_steer_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(rrow2, text="Reverse Turn Dir (Invert)", variable=self.invert_steer_var,
+                       bg="#ffffff", activebackground="#ffffff").pack(side="left", padx=4)
+
+        tk.Button(rrow2, text="Test Right", font=("Segoe UI", 8),
                   bg="#f1f5f9", fg="#334155", activebackground="#e2e8f0", bd=1, relief="solid",
-                  padx=8, pady=1, cursor="hand2", command=self.test_turn).pack(side="left", padx=8)
+                  padx=6, pady=1, cursor="hand2", command=self.test_turn).pack(side="left", padx=4)
 
         if not self.is_embedded:
             bf = tk.LabelFrame(right, text=" Bluetooth Connection ", font=("Segoe UI", 9, "bold"),
@@ -1024,13 +1028,17 @@ class RoutePlannerApp:
             dist = math.hypot(tx - pose[0], ty - pose[1])
 
             if abs(err) > TURN_THRESHOLD_DEG:
-                turn = CMD_RIGHT if (err > 0) == (TURN_SIGN > 0) else CMD_LEFT
-                self._tx(turn, " (turn)")
+                # err > 0 means clockwise in screen image coords (y down)
+                inv = bool(self.invert_steer_var.get())
+                effective_sign = -TURN_SIGN if inv else TURN_SIGN
+                turn = CMD_RIGHT if (err > 0) == (effective_sign > 0) else CMD_LEFT
+                turn_label = "R (6)" if turn == CMD_RIGHT else "L (4)"
+                self._tx(turn, " (turn %s, err=%.0f°)" % (turn_label, err))
                 time.sleep(TURN_PULSE_MS / 1000.0)
                 self._tx(CMD_STOP, " (settle)")
                 time.sleep(SETTLE_MS / 1000.0)
             else:
-                self._tx(CMD_FWD, " (fwd)")
+                self._tx(CMD_FWD, " (fwd, dist=%.0fcm)" % dist)
                 time.sleep(FORWARD_PULSE_MS / 1000.0)
                 self._tx(CMD_STOP, " (settle)")
                 time.sleep(SETTLE_MS / 1000.0)
