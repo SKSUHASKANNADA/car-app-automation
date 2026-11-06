@@ -1,4 +1,8 @@
 @echo off
 cd /d "%~dp0"
-"C:\Users\user\AppData\Local\Programs\Python\Python314\python.exe" car_control_app.py
+if exist ".venv\Scripts\python.exe" (
+    ".venv\Scripts\python.exe" car_control_app.py
+) else (
+    python car_control_app.py
+)
 pause

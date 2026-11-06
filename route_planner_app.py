@@ -418,6 +418,8 @@ class RoutePlannerApp:
         self._drive_thread = None
         self._cancel = threading.Event()
         self._paused_blocked = False
+        self._obstacle_detected = threading.Event()
+        self.last_ultrasonic_cm = 999
         self._start_time = 0.0
         self._last_progress = 0.0
         self._last_progress_pos = None
@@ -458,6 +460,11 @@ class RoutePlannerApp:
                  fg="#0f172a", bg="#ffffff").pack(side="left")
         tk.Label(banner_inner, text="Real-Time 2-Marker Vision Guidance (Car 10 • Goal 20)",
                  font=("Segoe UI", 9), fg="#64748b", bg="#ffffff").pack(side="left", padx=12)
+
+        self.sonic_pill = tk.Label(banner_inner, text="📡 Ultrasonic: Active",
+                                   font=("Segoe UI", 9, "bold"), fg="#16a34a", bg="#f1f5f9",
+                                   padx=10, pady=2, relief="solid", bd=1)
+        self.sonic_pill.pack(side="right", padx=10)
 
         top = tk.Frame(self.root, bg="#f8fafc")
         top.pack(fill="both", expand=True, padx=14, pady=4)
@@ -860,12 +867,39 @@ class RoutePlannerApp:
         self._photo = ImageTk.PhotoImage(image=im)
         self.canvas.itemconfig(self.canvas_img, image=self._photo)
 
+    def handle_rx_message(self, line):
+        """Processes incoming Bluetooth serial lines from Arduino (Ultrasonic guard)."""
+        line = line.strip()
+        if "FAULT:ULTRASONIC_LOOSE" in line:
+            if hasattr(self, "sonic_pill"):
+                self.sonic_pill.config(text="⚠️ Ultrasonic: WIRING LOOSE!", fg="#dc2626")
+            self.log("⚠️ Check ultrasonic sensor wiring (sensor stuck or loose)!")
+        elif line.startswith("BLOCKED:"):
+            try:
+                cm = int(line.split(":")[1])
+                self.last_ultrasonic_cm = cm
+                self._obstacle_detected.set()
+                if hasattr(self, "sonic_pill"):
+                    self.sonic_pill.config(text=f"🛑 BLOCKED: {cm} cm", fg="#dc2626")
+                self.log(f"🛑 ULTRASONIC SAFETY BRAKE: Obstacle detected at {cm} cm!")
+            except Exception:
+                pass
+        elif line.startswith("cm="):
+            try:
+                cm = int(line.split("=")[1].split()[0])
+                self.last_ultrasonic_cm = cm
+                if hasattr(self, "sonic_pill"):
+                    self.sonic_pill.config(text=f"📡 Ultrasonic: {cm} cm", fg="#16a34a")
+            except Exception:
+                pass
+
     def _poll_events(self):
         try:
             while True:
                 kind, payload = self.events.get_nowait()
                 if kind == "rx":
                     self.log("RX: %s" % payload)
+                    self.handle_rx_message(payload)
                 elif kind == "error":
                     self.log("Error: %s" % payload)
         except queue.Empty:
@@ -958,10 +992,17 @@ class RoutePlannerApp:
             return
 
         self._cancel.clear()
+        self._obstacle_detected.clear()
         self.driving = True
         self._start_time = time.time()
         self._last_progress = time.time()
         self._last_progress_pos = pose[:2]
+
+        # Put car into ROUTE mode so Arduino onboard ultrasonic safety guard is active
+        if not dry and self.link is not None and self.link.connected:
+            self._tx(MODE_ROUTE, " (enter route mode with ultrasonic guard)")
+            time.sleep(0.12)
+
         self._drive_thread = threading.Thread(target=self._drive_loop, daemon=True)
         self._drive_thread.start()
         self.log("Autonomous navigation started (%s)." % ("SIMULATION" if dry else "LIVE"))
@@ -1004,6 +1045,14 @@ class RoutePlannerApp:
             if pose is None or (now - pts) > POSE_MAX_AGE_S or lost_for > MARKER_LOST_S:
                 self._tx(CMD_STOP, " (marker lost)")
                 time.sleep(0.2)
+                continue
+
+            # Check onboard ultrasonic safety sensor
+            if self._obstacle_detected.is_set():
+                self._tx(CMD_STOP, " (ultrasonic obstacle detected!)")
+                self.log(f"⏸ PAUSED: Ultrasonic safety stop ({self.last_ultrasonic_cm} cm). Waiting 1s...")
+                time.sleep(1.0)
+                self._obstacle_detected.clear()
                 continue
 
             if wi >= len(wps):

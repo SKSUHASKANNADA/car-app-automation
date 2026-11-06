@@ -5,13 +5,15 @@ Run: python car_control_app.py
 HC-05 must be paired in Windows so it shows up as COM port.
 Labels F/B/L/R/S are for reading; bytes sent are digits in CMD_MAP.
 """
+import json
+import os
 import queue
 import threading
 import time
 import tkinter as tk
 import traceback
 from datetime import datetime
-from tkinter import ttk
+from tkinter import messagebox, ttk
 try:
     import serial
     from serial.tools import list_ports
@@ -38,6 +40,7 @@ PROBE_PING = STOP_CMD  # safe ping: stop; car stays still even if it hears us
 # Prefer ports whose HWID contains our HC-05's MAC tail (prevents picking
 # a generic placeholder port like COM5/COM6 whose HWID ends 000000000000).
 HC05_HWID_HINT = "FCA89A0004EA"
+CALIBRATION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "calibration.json")
 
 
 def probe_port_once(port, baud):
@@ -178,6 +181,16 @@ class CarApp:
         self.autonomous = False
         self.held_keys = set()
         self.route_window = None
+        self.route_app = None
+        self.classroom_window = None
+        self.classroom_app = None
+
+        # Calibration & Manual Drive Profiler State
+        self.drive_start_time = None
+        self.last_drive_elapsed = 0.0
+        self.calib_speed = 68.0
+        self.calib_turn_ms = 220
+        self._load_calibration()
 
         self._build_header()
         self._build_connection_bar()
@@ -296,12 +309,65 @@ class CarApp:
                                   command=self._toggle_mode)
         self.auto_btn.pack(fill="x", pady=4)
 
-        self.maze_btn = tk.Button(modes_frame, text="🎯 OPEN GOAL MAZE MODE (A* Camera Autopilot)",
+        self.maze_btn = tk.Button(modes_frame, text="🎯 OPEN GOAL MAZE (A* Camera Autopilot)",
                                   font=("Segoe UI", 10, "bold"),
                                   bg="#2563eb", fg="#ffffff", activebackground="#1d4ed8",
                                   bd=0, relief="flat", height=2, cursor="hand2",
                                   command=self._open_goal_maze)
         self.maze_btn.pack(fill="x", pady=4)
+
+        self.classroom_btn = tk.Button(modes_frame, text="🏫 CLASSROOM MAZE (Map Upload / No Cam Mode)",
+                                       font=("Segoe UI", 10, "bold"),
+                                       bg="#7c3aed", fg="#ffffff", activebackground="#6d28d9",
+                                       bd=0, relief="flat", height=2, cursor="hand2",
+                                       command=self._open_classroom_maze)
+        self.classroom_btn.pack(fill="x", pady=4)
+
+        # ---------------- Manual Drive Profiler & Calibrator ----------------
+        calib_box = tk.LabelFrame(card, text=" 📐 Manual Drive Calibrator (200 RPM Profiler) ",
+                                  font=("Segoe UI", 9, "bold"), fg=self.text_main, bg=self.card_bg, padx=10, pady=8)
+        calib_box.pack(fill="x", padx=14, pady=(4, 12))
+
+        # Row 1: Last Drive Time & Measured Distance Input
+        r1 = tk.Frame(calib_box, bg=self.card_bg)
+        r1.pack(fill="x", pady=2)
+
+        self.last_drive_lbl = tk.Label(r1, text="Last Forward Drive: 0.00 s", font=("Segoe UI", 9, "bold"),
+                                       fg=self.primary_blue, bg=self.card_bg)
+        self.last_drive_lbl.pack(side="left")
+
+        tk.Label(r1, text="Measured Distance (cm):", font=("Segoe UI", 9), fg=self.text_main, bg=self.card_bg).pack(side="left", padx=(14, 4))
+        self.measured_dist_var = tk.StringVar(value="100.0")
+        dist_ent = tk.Entry(r1, textvariable=self.measured_dist_var, width=8, font=("Segoe UI", 9), justify="center")
+        dist_ent.pack(side="left", padx=2)
+
+        calc_btn = tk.Button(r1, text="Calculate Speed", font=("Segoe UI", 8, "bold"),
+                             bg="#2563eb", fg="#ffffff", activebackground="#1d4ed8",
+                             cursor="hand2", command=self._calculate_speed)
+        calc_btn.pack(side="left", padx=6)
+
+        # Row 2: Turn Calibrator & Save
+        r2 = tk.Frame(calib_box, bg=self.card_bg)
+        r2.pack(fill="x", pady=(6, 2))
+
+        tk.Label(r2, text="90° Turn Time (ms):", font=("Segoe UI", 9), fg=self.text_main, bg=self.card_bg).pack(side="left")
+        self.turn_ms_var = tk.StringVar(value=str(self.calib_turn_ms))
+        turn_ent = tk.Entry(r2, textvariable=self.turn_ms_var, width=6, font=("Segoe UI", 9), justify="center")
+        turn_ent.pack(side="left", padx=4)
+
+        test_turn_btn = tk.Button(r2, text="Test 90° Turn", font=("Segoe UI", 8),
+                                  bg="#f1f5f9", fg="#334155", activebackground="#e2e8f0",
+                                  cursor="hand2", command=self._test_90_turn)
+        test_turn_btn.pack(side="left", padx=4)
+
+        self.calib_summary_lbl = tk.Label(r2, text=f"Speed: {self.calib_speed:.1f} cm/s | Turn: {self.calib_turn_ms} ms",
+                                          font=("Segoe UI", 8, "bold"), fg="#16a34a", bg=self.card_bg)
+        self.calib_summary_lbl.pack(side="left", padx=10)
+
+        save_calib_btn = tk.Button(r2, text="💾 Save Calibration", font=("Segoe UI", 8, "bold"),
+                                   bg="#16a34a", fg="#ffffff", activebackground="#15803d",
+                                   cursor="hand2", command=self._save_calibration)
+        save_calib_btn.pack(side="right")
 
     def _build_bottom(self):
         card = tk.Frame(self.root, bg=self.card_bg, bd=1, relief="solid", highlightthickness=0)
@@ -482,8 +548,88 @@ class CarApp:
     def _send_drive(self, digit, quiet_mode=False):
         if self.autonomous and not quiet_mode:
             self._set_mode(False, send=True)
+
+        # Track drive duration for calibration when moving forward (digit '8')
+        now = time.time()
+        if digit == CMD_MAP["F"]:
+            self.drive_start_time = now
+        elif digit == STOP_CMD:
+            if self.drive_start_time is not None:
+                self.last_drive_elapsed = max(0.01, now - self.drive_start_time)
+                self.drive_start_time = None
+                if hasattr(self, "last_drive_lbl"):
+                    self.last_drive_lbl.config(text=f"Last Forward Drive: {self.last_drive_elapsed:.2f} s")
+        else:
+            self.drive_start_time = None
+
         label = DIGIT_TO_LABEL.get(digit, "?")
         self._transmit(digit, " (%s)" % label)
+
+    def _load_calibration(self):
+        if os.path.exists(CALIBRATION_FILE):
+            try:
+                with open(CALIBRATION_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    self.calib_speed = float(data.get("speed_cm_s", 68.0))
+                    self.calib_turn_ms = int(data.get("turn_90_ms", 220))
+            except Exception:
+                pass
+
+    def _save_calibration(self):
+        try:
+            turn_ms = int(self.turn_ms_var.get())
+        except ValueError:
+            turn_ms = self.calib_turn_ms
+
+        data = {
+            "speed_cm_s": round(self.calib_speed, 2),
+            "turn_90_ms": turn_ms
+        }
+        try:
+            with open(CALIBRATION_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            self.calib_turn_ms = turn_ms
+            self.calib_summary_lbl.config(text=f"Speed: {self.calib_speed:.1f} cm/s | Turn: {self.calib_turn_ms} ms")
+            self._log(f"Saved calibration: Speed={self.calib_speed:.1f} cm/s, Turn 90°={self.calib_turn_ms} ms", "rx")
+            messagebox.showinfo("Calibration Saved", f"Successfully saved calibration to calibration.json!\n\nSpeed: {self.calib_speed:.1f} cm/s\nTurn 90°: {self.calib_turn_ms} ms")
+        except Exception as e:
+            self._log(f"Failed to save calibration: {e}", "err")
+            messagebox.showerror("Error", f"Failed to save calibration: {e}")
+
+    def _calculate_speed(self):
+        if self.last_drive_elapsed <= 0.05:
+            messagebox.showwarning("No Drive Recorded", "Please press and hold '▲ (F)' to drive the car forward for a measured run first!")
+            return
+        try:
+            dist = float(self.measured_dist_var.get())
+            if dist <= 0:
+                raise ValueError()
+        except ValueError:
+            messagebox.showerror("Invalid Input", "Please enter a valid measured distance in cm (e.g. 100).")
+            return
+
+        self.calib_speed = dist / self.last_drive_elapsed
+        self.calib_summary_lbl.config(text=f"Speed: {self.calib_speed:.1f} cm/s | Turn: {self.calib_turn_ms} ms")
+        self._log(f"Calculated Speed: {dist:.1f} cm / {self.last_drive_elapsed:.2f} s = {self.calib_speed:.1f} cm/s", "rx")
+        self._save_calibration()
+
+    def _test_90_turn(self):
+        if not (self.link and self.link.connected):
+            messagebox.showerror("Not Connected", "Please connect to the Car via Bluetooth first.")
+            return
+        try:
+            ms = int(self.turn_ms_var.get())
+        except ValueError:
+            ms = 220
+
+        def _turn_thread():
+            self._log(f"Testing 90° Right Turn pulse ({ms} ms)...")
+            self.link.send(CMD_MAP["R"])
+            time.sleep(ms / 1000.0)
+            self.link.send(STOP_CMD)
+            self._log("Turn complete. Check if the car turned exactly 90 degrees.")
+
+        threading.Thread(target=_turn_thread, daemon=True).start()
     def _send_raw(self):
         text = self.raw_var.get()
         if not text:
@@ -497,12 +643,13 @@ class CarApp:
     def _set_mode(self, auto, send):
         if send and not self._transmit(MODE_AUTO if auto else MODE_MANUAL, " (mode)"):
             return
+        if not auto and send:
+            # Always follow MANUAL with a STOP command so the car stops right away
+            self._transmit(STOP_CMD, " (S)")
         self.autonomous = auto
         if auto:
-            self.mode_btn.configure(text="Mode: AUTO FREEPLAY (click for MANUAL)")
             self.auto_btn.configure(text="AUTO: ON (click to stop)", bg="#c0392b")
         else:
-            self.mode_btn.configure(text="Mode: MANUAL (click for AUTO)")
             self.auto_btn.configure(text="MODE: AUTO (FREEPLAY)", bg="#1e8449")
 
     def _open_goal_maze(self):
@@ -520,16 +667,40 @@ class CarApp:
         top = tk.Toplevel(self.root)
         self.route_window = top
         self._log("Opened Goal Maze Mode window (connected to Bluetooth).")
-        app = RoutePlannerApp(top, shared_link=self.link)
+        self.route_app = RoutePlannerApp(top, shared_link=self.link)
 
         def _on_maze_close():
             try:
-                app._on_close()
+                self.route_app._on_close()
             except Exception:
                 pass
             self.route_window = None
+            self.route_app = None
 
         top.protocol("WM_DELETE_WINDOW", _on_maze_close)
+
+    def _open_classroom_maze(self):
+        if self.classroom_window is not None and tk.Toplevel.winfo_exists(self.classroom_window):
+            self.classroom_window.lift()
+            self.classroom_window.focus_force()
+            return
+
+        try:
+            from classroom_maze_app import ClassroomMazeApp
+        except ImportError as e:
+            self._log("Cannot load Classroom Maze window: %s" % e, "err")
+            return
+
+        top = tk.Toplevel(self.root)
+        self.classroom_window = top
+        self._log("Opened Classroom Maze Window.")
+        self.classroom_app = ClassroomMazeApp(top, shared_link=self.link)
+
+        def _on_cls_close():
+            self.classroom_window = None
+            self.classroom_app = None
+
+        top.protocol("WM_DELETE_WINDOW", _on_cls_close)
     def _typing_in_entry(self):
         w = self.root.focus_get()
         return isinstance(w, (tk.Entry, ttk.Entry, ttk.Combobox))
@@ -562,6 +733,27 @@ class CarApp:
                 kind, payload = self.events.get_nowait()
                 if kind == "rx":
                     self._log("RX: %s" % payload, "rx")
+                    if self.classroom_app is not None:
+                        try:
+                            self.classroom_app.handle_rx_message(payload)
+                        except Exception:
+                            pass
+                    if self.route_app is not None:
+                        try:
+                            self.route_app.handle_rx_message(payload)
+                        except Exception:
+                            pass
+                    if "FAULT:ULTRASONIC_LOOSE" in payload:
+                        # Sensor wire loose alert for all non-manual modes (Auto roam, Maze, etc.)
+                        self._log("⚠️ ALERT: Check ultrasonic sensor connectivity! Wire loose (stuck at 0 or timeout)!", "err")
+                        if self.autonomous:
+                            self._set_mode(False)  # stop auto roam to prevent crash
+                        messagebox.showwarning(
+                            "Ultrasonic Sensor Alert",
+                            "WARNING: Check Ultrasonic Sensor Connectivity!\n\n"
+                            "The sensor reading is stuck at 0 cm or 400+ cm.\n"
+                            "Please check the Trig, Echo, VCC, and GND jumper wires on the car."
+                        )
                 elif kind == "probe_done":
                     self._probe_finished(payload)
                 elif kind == "error":
@@ -583,6 +775,8 @@ def main():
         root = tk.Tk()
         CarApp(root)
         root.mainloop()
+    except KeyboardInterrupt:
+        pass
     except Exception:
         try:
             with open("app_error.log", "a") as f:
